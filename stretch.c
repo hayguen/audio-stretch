@@ -46,6 +46,7 @@
 
 struct stretch_cnxt {
     int num_chans, inbuff_samples, shortest, longest, tail, head, fast_mode;
+    int silence_samples;
     int16_t *inbuff, *calcbuff;
     float outsamples_error;
     uint32_t *results;
@@ -55,8 +56,8 @@ struct stretch_cnxt {
 };
 
 static void merge_blocks (int16_t *output, int16_t *input1, int16_t *input2, int samples);
-static int find_period_fast (struct stretch_cnxt *cnxt, int16_t *samples);
-static int find_period (struct stretch_cnxt *cnxt, int16_t *samples);
+static int find_period_fast (struct stretch_cnxt *cnxt, int16_t *samples, int *is_silent, int16_t silent_thr);
+static int find_period (struct stretch_cnxt *cnxt, int16_t *samples, int *is_silent, int16_t silent_thr);
 
 /*
  * Initialize a context of the time stretching code. The shortest and longest periods
@@ -85,6 +86,7 @@ StretchHandle stretch_init (int shortest_period, int longest_period, int num_cha
     cnxt = (struct stretch_cnxt *) calloc (1, sizeof (struct stretch_cnxt));
 
     if (cnxt) {
+        cnxt->silence_samples = 0;
         cnxt->inbuff_samples = longest_period * num_channels * max_periods;
         cnxt->inbuff = calloc (cnxt->inbuff_samples, sizeof (*cnxt->inbuff));
 
@@ -173,7 +175,7 @@ int stretch_output_capacity (StretchHandle handle, int max_num_samples, float ma
  * plus 3X the longest period (or 4X the longest period in "fast" mode).
  */
 
-int stretch_samples (StretchHandle handle, const int16_t *samples, int num_samples, int16_t *output, float ratio)
+int stretch_samples_ex (StretchHandle handle, const int16_t *samples, int num_samples, int16_t *output, float ratio, float silence_ratio, int silence_after_num_samples, int16_t silence_threshold)
 {
     struct stretch_cnxt *cnxt = (struct stretch_cnxt *) handle;
     int out_samples = 0, next_samples = 0;
@@ -226,15 +228,25 @@ int stretch_samples (StretchHandle handle, const int16_t *samples, int num_sampl
 
         while (cnxt->tail >= cnxt->longest && cnxt->head - cnxt->tail >= cnxt->longest * (cnxt->fast_mode ? 3 : 2)) {
             float process_ratio;
-            int period;
+            int period, is_silent, process_silence = 0;
 
             if (ratio != 1.0 || cnxt->outsamples_error)
-                period = cnxt->fast_mode ? find_period_fast (cnxt, cnxt->inbuff + cnxt->tail) :
-                    find_period (cnxt, cnxt->inbuff + cnxt->tail);
+                period = cnxt->fast_mode ? find_period_fast (cnxt, cnxt->inbuff + cnxt->tail, &is_silent, silence_threshold) :
+                    find_period (cnxt, cnxt->inbuff + cnxt->tail, &is_silent, silence_threshold);
             else
                 period = cnxt->longest;
 
             // printf ("%d\n", period / cnxt->num_chans);
+
+            if (is_silent) {
+                if ( cnxt->silence_samples >= silence_after_num_samples ) {
+                    process_silence = 1;
+                    cnxt->silence_samples = silence_after_num_samples * 2;  // avoid overflow
+                }
+                cnxt->silence_samples += period;
+            }
+            else
+                cnxt->silence_samples = 0;
 
             /*
              * Once we have calculated the best-match period, there are 4 possible transformations
@@ -252,7 +264,13 @@ int stretch_samples (StretchHandle handle, const int16_t *samples, int num_sampl
             else
                 process_ratio = ceil (ratio * 2.0) / 2.0;
 
-            if (process_ratio == 0.5) {
+            if (process_silence) {
+                int N = (int)(silence_ratio * 2 * period);
+                memset (outbuf + out_samples, 0, N * sizeof (cnxt->inbuff [0]));
+                out_samples += N;
+                cnxt->tail += period * 2;
+            }
+            else if (process_ratio == 0.5) {
                 merge_blocks (outbuf + out_samples, cnxt->inbuff + cnxt->tail,
                     cnxt->inbuff + cnxt->tail + period, period);
                 cnxt->outsamples_error += period - (period * 2.0 * ratio);
@@ -302,7 +320,7 @@ int stretch_samples (StretchHandle handle, const int16_t *samples, int num_sampl
             /* if there's another cascaded instance after this, pass the just stretched samples into that */
 
             if (cnxt->next) {
-                next_samples += stretch_samples (cnxt->next, outbuf, out_samples / cnxt->num_chans, output + next_samples * cnxt->num_chans, next_ratio);
+                next_samples += stretch_samples (cnxt->next, outbuf, out_samples / cnxt->num_chans, output + next_samples * cnxt->num_chans, (process_silence ? 1.0 : next_ratio));
                 out_samples = 0;
             }
 
@@ -342,6 +360,11 @@ int stretch_samples (StretchHandle handle, const int16_t *samples, int num_sampl
 
     return cnxt->next ? next_samples : out_samples / cnxt->num_chans;
 }  
+
+int stretch_samples (StretchHandle handle, const int16_t *samples, int num_samples, int16_t *output, float ratio)
+{
+    return stretch_samples_ex (handle, samples, num_samples, output, ratio, ratio, 0, 0);
+}
 
 /*
  * Flush any leftover samples out at normal speed. For cascaded dual instances this must be called
@@ -403,9 +426,9 @@ void stretch_deinit (StretchHandle handle)
  * denominator need be completely recalculated.
  */
 
-static int find_period (struct stretch_cnxt *cnxt, int16_t *samples)
+static int find_period (struct stretch_cnxt *cnxt, int16_t *samples, int *is_silent, int16_t silence_thr)
 {
-    uint32_t sum, diff, factor, scaler, best_factor = 0;
+    uint32_t sum, diff, factor, scaler, best_factor = 0, best_sum = 0, silence_thresh;
     int16_t *calcbuff = samples;
     int period, best_period;
     int i, j;
@@ -426,6 +449,7 @@ static int find_period (struct stretch_cnxt *cnxt, int16_t *samples)
 
     // if silence return longest period, else calculate scaler based on largest sum
 
+    *is_silent = 1;
     if (sum)
         scaler = (MAX_CORR - 1) / sum;
     else
@@ -460,6 +484,7 @@ static int find_period (struct stretch_cnxt *cnxt, int16_t *samples)
 
         if (factor >= best_factor) {
             best_factor = factor;
+            best_sum = sum;
             best_period = period;
         }
 
@@ -474,6 +499,8 @@ static int find_period (struct stretch_cnxt *cnxt, int16_t *samples)
         period++;
     }
 
+    silence_thresh = (uint32_t)silence_thr * 2 * (uint32_t)best_period;
+    *is_silent = (best_sum <= silence_thresh) ? 1 : 0;
     return best_period * cnxt->num_chans;
 }
 
@@ -487,9 +514,9 @@ static int find_period (struct stretch_cnxt *cnxt, int16_t *samples)
  * side of the peak are compared to calculate a more accurate center of the period.
  */
 
-static int find_period_fast (struct stretch_cnxt *cnxt, int16_t *samples)
+static int find_period_fast (struct stretch_cnxt *cnxt, int16_t *samples, int *is_silent, int16_t silence_thr)
 {
-    uint32_t sum, diff, scaler, best_factor = 0;
+    uint32_t sum, diff, scaler, best_factor = 0, best_sum = 0, silence_thresh;
     int period, best_period;
     int i, j;
 
@@ -506,6 +533,7 @@ static int find_period_fast (struct stretch_cnxt *cnxt, int16_t *samples)
 
     // if silence return longest period, else calculate scaler based on largest sum
 
+    *is_silent = 1;
     if (sum)
         scaler = (MAX_CORR - 1) / sum;
     else
@@ -540,6 +568,7 @@ static int find_period_fast (struct stretch_cnxt *cnxt, int16_t *samples)
 
         if (cnxt->results [period] >= best_factor) {    /* check if best yet */
             best_factor = cnxt->results [period];
+            best_sum = sum;
             best_period = period;
         }
 
@@ -553,6 +582,9 @@ static int find_period_fast (struct stretch_cnxt *cnxt, int16_t *samples)
         sum += abs32 (cnxt->calcbuff [period * 2]) + abs32 (cnxt->calcbuff [period * 2 + 1]);
         period++;
     }
+
+    silence_thresh = (uint32_t)silence_thr * 2 * (uint32_t)best_period;
+    *is_silent = (best_sum <= silence_thresh) ? 1 : 0;
 
     if (best_period * cnxt->num_chans * 2 != cnxt->shortest && best_period * cnxt->num_chans * 2 != cnxt->longest) {
         uint32_t high_side_diff = cnxt->results [best_period] - cnxt->results [best_period+1];
